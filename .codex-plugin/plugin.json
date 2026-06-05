@@ -1,0 +1,12 @@
+{
+  "name": "oj",
+  "version": "0.0.2",
+  "description": "Mandatory adversarial review for Codex CLI — 16 expert subagents that push back",
+  "author": {"name": "OpenJunto authors"},
+  "license": "MIT",
+  "repository": "https://github.com/openjunto/oj-codex",
+  "homepage": "https://github.com/openjunto/oj-codex",
+  "keywords": ["openjunto", "coordination", "multi-agent", "deliberation", "codex"],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}

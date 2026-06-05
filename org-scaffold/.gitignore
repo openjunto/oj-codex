@@ -1,0 +1,7 @@
+# Volatile session state — not shared across team members
+state/*
+!state/.gitkeep
+
+# Local editor artifacts
+.DS_Store
+*.swp

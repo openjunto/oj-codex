@@ -1,0 +1,4 @@
+# Generation scaffolding (written by juntogen/codex/generate; not part of the plugin)
+.oj-codex-sentinels/
+prompts-built/
+platform-declaration.yaml

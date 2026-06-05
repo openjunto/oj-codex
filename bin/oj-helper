@@ -1,0 +1,728 @@
+#!/usr/bin/env bash
+# oj-helper — dispatcher for OpenJunto utility subcommands (Codex binding)
+set -euo pipefail
+
+# Source the pinned-string contracts library. Load-bearing: the
+# CONDUCTOR.md-missing stderr literal (OJ_STDERR_CONDUCTOR_MISSING)
+# lives in lib/contracts.sh and is pattern-matched by the test harness
+# AND grep-asserted by the structural validator (drift canary). If
+# sourcing fails, die loudly — silent fallback to a hardcoded literal
+# would defeat the entire centralization.
+_OJ_SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+if [[ ! -r "${_OJ_SCRIPT_DIR}/lib/contracts.sh" ]]; then
+  echo "ERROR: oj-helper: required contracts library missing at ${_OJ_SCRIPT_DIR}/lib/contracts.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/contracts.sh
+source "${_OJ_SCRIPT_DIR}/lib/contracts.sh"
+
+AGENTS_DIR="${CODEX_HOME:-$HOME/.codex}/agents"
+
+debug() { [[ "${OJ_HOOK_DEBUG:-${JUNTO_HOOK_DEBUG:-0}}" == "1" ]] && echo "[oj-helper] $*" >&2 || true; }
+die()   { echo "ERROR: $*" >&2; exit 1; }
+
+# ────────────────────────────────────────────────────────────────────
+# Shared helpers
+# ────────────────────────────────────────────────────────────────────
+
+_oj_plugin_version() {
+  local ver_file=""
+  if [[ -n "${PLUGIN_ROOT:-}" && -r "${PLUGIN_ROOT}/VERSION" ]]; then
+    ver_file="${PLUGIN_ROOT}/VERSION"
+  else
+    local _script_rel
+    _script_rel="$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")"
+    if [[ -r "${_script_rel}/../VERSION" ]]; then
+      ver_file="${_script_rel}/../VERSION"
+    fi
+  fi
+  if [[ -n "$ver_file" ]]; then
+    head -1 "$ver_file" | tr -d '[:space:]'
+  else
+    echo "unknown"
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────
+# Issue tracker helpers
+# ────────────────────────────────────────────────────────────────────
+
+tracker_require_auth() {
+  if ! command -v gh >/dev/null 2>&1; then
+    die "gh not found. Install via: brew install gh"
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    die "GitHub auth required. Run: gh auth login"
+  fi
+}
+
+tracker_require_jq() {
+  if ! command -v jq >/dev/null 2>&1; then
+    die "jq is required but not found. Install via: brew install jq"
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────
+# Migration helpers
+# ────────────────────────────────────────────────────────────────────
+
+_migrate_plugin_version() { _oj_plugin_version; }
+
+_migrate_atomic_write() {
+  local dest="$1"
+  local body="$2"
+  local tmpfile
+  tmpfile="$(mktemp "$(dirname "$dest")/.oj-migrate.XXXXXX")"
+  printf '%s\n' "$body" > "$tmpfile"
+  mv "$tmpfile" "$dest"
+}
+
+_migrate_detect_legacy() {
+  local findings=()
+  # Codex Makefile-era version file
+  if [[ -f "${HOME}/.codex/.oj-version" ]]; then
+    findings+=("${HOME}/.codex/.oj-version exists (Makefile-era version file)")
+  fi
+  # Makefile symlink install (platform-agnostic)
+  if [[ -L "${HOME}/.local/bin/oj-helper" ]]; then
+    findings+=("${HOME}/.local/bin/oj-helper is a symlink (Makefile install)")
+  fi
+  # Codex config references oj-helper (jq-independent: grep only)
+  if [[ -f "${HOME}/.codex/config.toml" ]] && grep -q "oj-helper" "${HOME}/.codex/config.toml" 2>/dev/null; then
+    findings+=("${HOME}/.codex/config.toml references oj-helper")
+  fi
+  printf '%s\n' "${findings[@]+"${findings[@]}"}"
+}
+
+# ────────────────────────────────────────────────────────────────────
+# Conductor helpers
+# ────────────────────────────────────────────────────────────────────
+
+_conductor_emit_banner() {
+  echo "OpenJunto v$(_oj_plugin_version) active — OpenJunto coordination system" >&2
+}
+
+_conductor_resolve_path() {
+  if [[ -n "${PLUGIN_ROOT:-}" && -r "${PLUGIN_ROOT}/CONDUCTOR.md" ]]; then
+    echo "${PLUGIN_ROOT}/CONDUCTOR.md"
+    return 0
+  fi
+  local _script_rel
+  _script_rel="$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")"
+  local _fallback="${_script_rel}/../CONDUCTOR.md"
+  if [[ -r "$_fallback" ]]; then
+    echo "$_fallback"
+    return 0
+  fi
+  return 1
+}
+
+_conductor_emit_empty_json() {
+  echo '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}'
+}
+
+# ────────────────────────────────────────────────────────────────────
+# Subcommands
+# ────────────────────────────────────────────────────────────────────
+
+# 1. inject-profile — SubagentStart Hook (Onboard fallback on Codex)
+#
+# On Codex the primary Onboard path is native agent-definition TOML files;
+# this hook is the fallback for dynamically-identified profiles.
+# platform-snapshot.yaml: hooks[point="SubagentStart"].matchers = []
+# (empty — no agent-type filter; all subagents are eligible).
+cmd_inject_profile() {
+  if ! command -v jq >/dev/null 2>&1; then
+    debug "jq not found; skipping profile injection"
+    return 0
+  fi
+
+  local hook_json
+  hook_json="$(cat)"
+
+  local agent_id agent_type transcript_path
+  agent_id="$(echo "$hook_json" | jq -r '.agent_id // .agentId // ""' 2>/dev/null || echo "")"
+  agent_type="$(echo "$hook_json" | jq -r '.agent_type // .agentType // ""' 2>/dev/null || echo "")"
+  transcript_path="$(echo "$hook_json" | jq -r '.transcript_path // .transcriptPath // ""' 2>/dev/null || echo "")"
+
+  debug "inject-profile: agent_type='${agent_type}' agent_id='${agent_id}'"
+
+  if [[ -z "$agent_id" || -z "$transcript_path" ]]; then
+    debug "missing agent_id or transcript_path in hook payload"
+    return 0
+  fi
+
+  # Derive subagent transcript path
+  local session_dir="${transcript_path%.jsonl}"
+  local agent_transcript="${session_dir}/subagents/agent-${agent_id}.jsonl"
+
+  # Wait up to 500ms for transcript file
+  local i=0
+  while [[ ! -f "$agent_transcript" && $i -lt 5 ]]; do
+    sleep 0.1
+    (( i++ )) || true
+  done
+  if [[ ! -f "$agent_transcript" ]]; then
+    debug "transcript not found after 500ms: ${agent_transcript}"
+    return 0
+  fi
+
+  # Read spawn prompt from first line of transcript
+  local first_line
+  first_line="$(head -1 "$agent_transcript" 2>/dev/null || echo "")"
+  if [[ -z "$first_line" ]]; then
+    debug "spawn prompt empty or unparseable for agent ${agent_id}"
+    return 0
+  fi
+
+  local content_type
+  content_type="$(echo "$first_line" | jq -r '(.message.content // .content) | type' 2>/dev/null || echo "null")"
+
+  local spawn_prompt=""
+  if [[ "$content_type" == "string" ]]; then
+    spawn_prompt="$(echo "$first_line" | jq -r '.message.content // .content // ""' 2>/dev/null || echo "")"
+  elif [[ "$content_type" == "array" ]]; then
+    spawn_prompt="$(echo "$first_line" | jq -r \
+      '[(.message.content // .content)[] | select(.type=="text") | .text] | join("")' \
+      2>/dev/null || echo "")"
+  fi
+
+  if [[ -z "$spawn_prompt" ]]; then
+    debug "spawn prompt empty or unparseable for agent ${agent_id}"
+    return 0
+  fi
+
+  # Expert identification — HTML marker (primary), legacy junto-expert, path pattern (fallback)
+  local profile_name=""
+
+  if [[ "$spawn_prompt" =~ \<\!--\ oj-expert:\ ([a-z][a-z0-9-]+)\ --\> ]]; then
+    profile_name="${BASH_REMATCH[1]}"
+    debug "identified profile '${profile_name}' via HTML marker"
+  elif [[ "$spawn_prompt" =~ \<\!--\ junto-expert:\ ([a-z][a-z0-9-]+)\ --\> ]]; then
+    profile_name="${BASH_REMATCH[1]}"
+    debug "identified profile '${profile_name}' via HTML marker (legacy junto-expert)"
+  elif [[ "$spawn_prompt" =~ /\.codex/agents/([a-z][a-z0-9-]+)\.md ]]; then
+    profile_name="${BASH_REMATCH[1]}"
+    debug "identified profile '${profile_name}' via path pattern"
+  elif [[ "$spawn_prompt" =~ /\.claude/agents/([a-z][a-z0-9-]+)\.md ]]; then
+    profile_name="${BASH_REMATCH[1]}"
+    debug "identified profile '${profile_name}' via path pattern"
+  fi
+
+  if [[ -z "$profile_name" ]]; then
+    debug "no expert marker detected for agent ${agent_id}"
+    return 0
+  fi
+
+  # Path traversal guard
+  if [[ "$profile_name" == *".."* || "$profile_name" == *"/"* ]]; then
+    debug "rejected profile name '${profile_name}' (path traversal)"
+    return 0
+  fi
+
+  local preamble_path="${AGENTS_DIR}/_preamble.md"
+  local profile_path="${AGENTS_DIR}/${profile_name}.md"
+  local compact_path="${AGENTS_DIR}/compact/${profile_name}.md"
+
+  if [[ ! -r "$preamble_path" ]]; then
+    debug "preamble not found: ${preamble_path}"
+    return 0
+  fi
+  local preamble_content
+  preamble_content="$(cat "$preamble_path")"
+
+  local profile_content=""
+  if [[ -r "$profile_path" ]]; then
+    profile_content="$(cat "$profile_path")"
+    debug "loaded full profile: ${profile_path}"
+  elif [[ -r "$compact_path" ]]; then
+    profile_content="$(cat "$compact_path")"
+    debug "loaded compact profile (full not found): ${compact_path}"
+  else
+    debug "no profile found for '${profile_name}' (checked full and compact)"
+    return 0
+  fi
+
+  local context_string="${preamble_content}
+
+---
+
+${profile_content}"
+
+  debug "injecting profile '${profile_name}' (~${#context_string} bytes)"
+
+  jq -n --arg ctx "$context_string" '{
+    hookSpecificOutput: {
+      hookEventName: "SubagentStart",
+      additionalContext: $ctx
+    }
+  }'
+}
+
+# 2. conductor-inject — SessionStart Hook
+cmd_conductor_inject() {
+  # Step 0: version banner fires on every path, stderr only
+  _conductor_emit_banner
+
+  # Step 1: jq required for safe JSON encoding
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "OpenJunto: jq required for CONDUCTOR injection; install via \`brew install jq\` or equivalent" >&2
+    _conductor_emit_empty_json
+    return 0
+  fi
+
+  # Step 2: resolve CONDUCTOR.md path
+  local conductor_path=""
+  if ! conductor_path="$(_conductor_resolve_path 2>/dev/null)"; then
+    conductor_path=""
+  fi
+
+  # Step 4: CONDUCTOR.md missing or unreadable
+  if [[ -z "$conductor_path" || ! -r "$conductor_path" ]]; then
+    echo "${OJ_STDERR_CONDUCTOR_MISSING}" >&2
+    _conductor_emit_empty_json
+    return 0
+  fi
+
+  # Step 5: CONDUCTOR.md present but empty
+  if [[ ! -s "$conductor_path" ]]; then
+    _conductor_emit_empty_json
+    return 0
+  fi
+
+  # Step 6: inject CONDUCTOR.md contents as additionalContext
+  if jq --rawfile body "$conductor_path" -n '{
+    hookSpecificOutput: {
+      hookEventName: "SessionStart",
+      additionalContext: $body
+    }
+  }' 2>/dev/null; then
+    return 0
+  fi
+  # Fallback for older jq without --rawfile
+  jq -Rs '{
+    hookSpecificOutput: {
+      hookEventName: "SessionStart",
+      additionalContext: .
+    }
+  }' < "$conductor_path"
+}
+
+# 3. migrate-legacy — SessionStart Hook (Legacy Install Detection)
+cmd_migrate_legacy() {
+  local xdg_root="${XDG_CONFIG_HOME:-$HOME/.config}/oj"
+  local backup_sentinel="${xdg_root}/.migration-done"
+  local data_sentinel=""
+  if [[ -n "${CODEX_PLUGIN_DATA:-}" ]]; then
+    data_sentinel="${CODEX_PLUGIN_DATA}/.migration-done"
+  fi
+
+  # Self-healing: backup present but data-dir sentinel absent → replay backup into data-dir
+  if [[ -f "$backup_sentinel" ]] && { [[ -z "$data_sentinel" ]] || [[ ! -f "$data_sentinel" ]]; }; then
+    echo "[oj] migration: already complete (backup sentinel found)" >&2
+    if [[ -n "$data_sentinel" ]]; then
+      mkdir -p "$(dirname "$data_sentinel")" 2>/dev/null || true
+      cp "$backup_sentinel" "$data_sentinel" 2>/dev/null || true
+    fi
+    return 0
+  fi
+
+  # Either-OR presence semantics: if either sentinel exists, migration is done
+  if [[ -f "$backup_sentinel" ]] || { [[ -n "$data_sentinel" ]] && [[ -f "$data_sentinel" ]]; }; then
+    return 0
+  fi
+
+  # Concurrency lock
+  mkdir -p "$xdg_root"
+  local lockdir="${xdg_root}/.migration.lock"
+  if ! mkdir "$lockdir" 2>/dev/null; then
+    # Stale-lock recovery: reclaim if older than 60s (-mmin +1)
+    if [[ -n "$(find "$lockdir" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+      rm -rf "$lockdir" 2>/dev/null || true
+      if ! mkdir "$lockdir" 2>/dev/null; then
+        return 0
+      fi
+    else
+      return 0
+    fi
+  fi
+  trap 'rmdir "${lockdir}" 2>/dev/null || true' EXIT
+
+  local findings
+  findings="$(_migrate_detect_legacy)"
+
+  local migration_source="clean-install"
+  local plugin_version
+  plugin_version="$(_migrate_plugin_version)"
+  local migrated_at
+  migrated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")"
+
+  if [[ -n "$findings" ]]; then
+    migration_source="makefile-era"
+    local unix_ts
+    unix_ts="$(date +%s 2>/dev/null || echo "0")"
+    local log_file="${xdg_root}/migration-${unix_ts}.log"
+    printf '%s\n' "$findings" > "$log_file" 2>/dev/null || true
+    echo "[oj] Legacy install detected (see ${log_file})" >&2
+  fi
+
+  local sentinel_body="schema_version=1
+plugin_version=${plugin_version}
+migrated_at=${migrated_at}
+migration_source=${migration_source}"
+
+  # Write backup-FIRST (authoritative), then data-dir (soft hint)
+  mkdir -p "$xdg_root"
+  _migrate_atomic_write "$backup_sentinel" "$sentinel_body"
+
+  if [[ -n "$data_sentinel" ]]; then
+    mkdir -p "$(dirname "$data_sentinel")" 2>/dev/null || true
+    _migrate_atomic_write "$data_sentinel" "$sentinel_body" 2>/dev/null || true
+  fi
+
+  return 0
+}
+
+# 4. feedback-path — Dev Mode Feedback Path
+cmd_feedback_path() {
+  local devmode="${OJ_DEVMODE:-${JUNTO_DEVMODE:-0}}"
+  if [[ "$devmode" != "1" ]]; then
+    return 0
+  fi
+
+  local origin_url
+  origin_url="$(git remote get-url origin 2>/dev/null || echo "")"
+  if [[ -z "$origin_url" ]]; then
+    return 0
+  fi
+
+  local orgrepo
+  orgrepo="$(echo "$origin_url" | sed 's/\.git$//' | sed 's|.*[:/]\([^/]*/[^/]*\)$|\1|')"
+
+  local feedback_dir="${CODEX_HOME:-$HOME/.codex}/dev/feedback/${orgrepo}"
+  mkdir -p "$feedback_dir"
+
+  local ts
+  ts="$(date -u '+%Y-%m-%dT%H%M%S' 2>/dev/null || echo "unknown")"
+  echo "${feedback_dir}/${ts}.md"
+}
+
+# 5. issue-tracker-check — Validate Issue Tracker Prerequisites
+cmd_issue_tracker_check() {
+  local project="${ISSUE_TRACKER_PROJECT:-}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project) project="$2"; shift 2 ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+
+  local -a errors=()
+  if ! command -v gh >/dev/null 2>&1; then
+    errors+=("gh not found. Install via: brew install gh")
+  elif ! gh auth status >/dev/null 2>&1; then
+    errors+=("GitHub auth required. Run: gh auth login")
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    errors+=("jq not found. Install via: brew install jq")
+  fi
+
+  if [[ ${#errors[@]} -gt 0 ]]; then
+    local err_json
+    if command -v jq >/dev/null 2>&1; then
+      err_json="$(printf '%s\n' "${errors[@]}" | jq -R . | jq -s '{"ok":false,"errors":.,"project":null}')"
+    else
+      err_json='{"ok":false,"errors":[],"project":null}'
+    fi
+    echo "$err_json"
+    return 1
+  fi
+
+  if [[ -z "$project" ]]; then
+    project="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "")"
+  fi
+
+  if [[ -n "$project" ]]; then
+    jq -n --arg p "$project" '{"ok":true,"project":$p}'
+  else
+    echo '{"ok":true,"project":null}'
+  fi
+}
+
+# 6. issue-tracker-list — List Open Issues
+cmd_issue_tracker_list() {
+  tracker_require_auth
+  tracker_require_jq
+
+  local project="${ISSUE_TRACKER_PROJECT:-}"
+  local status="open"
+  local limit=50
+  local label=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project) project="$2"; shift 2 ;;
+      --status)  status="$2";  shift 2 ;;
+      --limit)   limit="$2";   shift 2 ;;
+      --label)   label="$2";   shift 2 ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+
+  if [[ -z "$project" ]]; then
+    project="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "")"
+  fi
+
+  local -a args=(gh issue list --json number,title,state,labels,assignees,body)
+  [[ -n "$project" ]] && args+=(--repo "$project")
+  args+=(--state "$status" --limit "$limit")
+  [[ -n "$label" ]] && args+=(--label "$label")
+
+  "${args[@]}"
+}
+
+# 7. issue-tracker-create — Create Issue
+cmd_issue_tracker_create() {
+  tracker_require_auth
+  tracker_require_jq
+
+  local project="${ISSUE_TRACKER_PROJECT:-}"
+  local title=""
+  local body=""
+  local -a labels=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project) project="$2";         shift 2 ;;
+      --title)   title="$2";           shift 2 ;;
+      --body)    body="$2";            shift 2 ;;
+      --label)   labels+=("$2");       shift 2 ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+
+  [[ -z "$title" ]] && die "--title is required"
+
+  if [[ -z "$project" ]]; then
+    project="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "")"
+  fi
+
+  local -a create_args=(gh issue create --title "$title")
+  [[ -n "$project" ]] && create_args+=(--repo "$project")
+  [[ -n "$body" ]]    && create_args+=(--body "$body")
+  for lbl in "${labels[@]+"${labels[@]}"}"; do
+    create_args+=(--label "$lbl")
+  done
+
+  local create_out
+  create_out="$("${create_args[@]}")"
+
+  # Extract issue number from returned URL and view for JSON
+  local issue_num="${create_out##*/}"
+  if [[ "$issue_num" =~ ^[0-9]+$ ]]; then
+    local -a view_args=(gh issue view "$issue_num" --json number,title,state,url)
+    [[ -n "$project" ]] && view_args+=(--repo "$project")
+    "${view_args[@]}" 2>/dev/null \
+      || jq -n --arg url "$create_out" '{"url":$url}'
+  else
+    jq -n --arg url "$create_out" '{"url":$url}'
+  fi
+}
+
+# 8. issue-tracker-view — View Issue Details
+cmd_issue_tracker_view() {
+  tracker_require_auth
+  tracker_require_jq
+
+  local project="${ISSUE_TRACKER_PROJECT:-}"
+  local number=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project) project="$2"; shift 2 ;;
+      [0-9]*)    number="$1";  shift ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+
+  [[ -z "$number" ]] && die "Issue number required"
+
+  if [[ -z "$project" ]]; then
+    project="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "")"
+  fi
+
+  local -a args=(gh issue view "$number" --json number,title,state,body,comments,labels,assignees)
+  [[ -n "$project" ]] && args+=(--repo "$project")
+
+  "${args[@]}"
+}
+
+# 9. issue-tracker-transition — Change Issue State
+cmd_issue_tracker_transition() {
+  tracker_require_auth
+
+  local number=""
+  local status=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status) status="$2"; shift 2 ;;
+      [0-9]*)   number="$1"; shift ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+
+  [[ -z "$number" ]] && die "Issue number required"
+  [[ -z "$status" ]] && die "--status is required (open|closed)"
+
+  case "$status" in
+    closed) gh issue close "$number" ;;
+    open)   gh issue reopen "$number" ;;
+    *) die "Invalid status: ${status} (must be open|closed)" ;;
+  esac
+}
+
+# 10. issue-tracker-comment — Add Comment to Issue
+cmd_issue_tracker_comment() {
+  tracker_require_auth
+
+  local number=""
+  local body=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --body) body="$2"; shift 2 ;;
+      [0-9]*) number="$1"; shift ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+
+  [[ -z "$number" ]] && die "Issue number required"
+  [[ -z "$body" ]]   && die "--body is required"
+
+  gh issue comment "$number" --body "$body"
+}
+
+# 11. issue-tracker-link-list — List Cross-References
+cmd_issue_tracker_link_list() {
+  tracker_require_auth
+  tracker_require_jq
+
+  local number=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      [0-9]*) number="$1"; shift ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+
+  [[ -z "$number" ]] && die "Issue number required"
+
+  local issue_json
+  issue_json="$(gh issue view "$number" --json body,comments)"
+
+  echo "$issue_json" | jq '[
+    (.body // ""),
+    ((.comments // []) | .[] | .body // "")
+  ] | join("\n") | [
+    scan("(?:([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#([0-9]+))")
+    | { key: (if .[0] != "" then (.[0] + "#" + .[1]) else ("#" + .[1]) end), summary: "" }
+  ] | unique_by(.key)'
+}
+
+# 12. subagents-check — Convene Gate (Codex capability probe)
+#
+# Codex analog of the Claude agent-teams-check. Always exits 0 (Axiom 8:
+# the fallback IS the proceed path). On Codex, subagents are available by
+# default (agents.max_threads=6); degradation is rare but preserved for
+# CODEX_SUBAGENTS_DISABLED=1 or CODEX_AGENTS_MAX_THREADS=0 environments.
+cmd_subagents_check() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+
+  local disabled="${CODEX_SUBAGENTS_DISABLED:-0}"
+  local max_threads="${CODEX_AGENTS_MAX_THREADS:-6}"
+
+  local available="true"
+  local reason="subagents_available"
+
+  if [[ "$disabled" == "1" ]]; then
+    available="false"
+    reason="env_disabled"
+  elif [[ "$max_threads" == "0" ]]; then
+    available="false"
+    reason="max_threads_zero"
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -n --argjson avail "$available" --arg r "$reason" \
+      '{ok: true, available: $avail, reason: $r}'
+  else
+    if [[ "$available" == "true" ]]; then
+      echo '{"ok":true,"available":true,"reason":"subagents_available"}'
+    else
+      printf '{"ok":true,"available":false,"reason":"%s"}\n' "$reason"
+    fi
+  fi
+  return 0
+}
+
+# ────────────────────────────────────────────────────────────────────
+# Dispatcher
+# ────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  inject-profile)            shift; cmd_inject_profile "$@" ;;
+  conductor-inject)          shift; cmd_conductor_inject "$@" ;;
+  migrate-legacy)            shift; cmd_migrate_legacy "$@" ;;
+  feedback-path)             shift; cmd_feedback_path "$@" ;;
+  issue-tracker-check)       shift; cmd_issue_tracker_check "$@" ;;
+  issue-tracker-list)        shift; cmd_issue_tracker_list "$@" ;;
+  issue-tracker-create)      shift; cmd_issue_tracker_create "$@" ;;
+  issue-tracker-view)        shift; cmd_issue_tracker_view "$@" ;;
+  issue-tracker-transition)  shift; cmd_issue_tracker_transition "$@" ;;
+  issue-tracker-comment)     shift; cmd_issue_tracker_comment "$@" ;;
+  issue-tracker-link-list)   shift; cmd_issue_tracker_link_list "$@" ;;
+  subagents-check)           shift; cmd_subagents_check "$@" ;;
+  help|--help|-h|"")
+    cat <<'EOF'
+oj-helper — dispatcher for OpenJunto utility subcommands (Codex binding)
+
+USAGE:
+  oj-helper <subcommand> [args...]
+
+SUBCOMMANDS:
+  inject-profile       Inject expert profile into spawned sub-agents (SubagentStart hook)
+  conductor-inject     Inject CONDUCTOR.md at session start (SessionStart hook)
+  migrate-legacy       Detect Makefile-era install and write migration sentinels
+  feedback-path        Output feedback file path for dev mode (OJ_DEVMODE=1)
+
+  issue-tracker-check        Validate issue tracker prerequisites and discover project
+  issue-tracker-list         List open issues
+  issue-tracker-create       Create an issue
+  issue-tracker-view         View issue details
+  issue-tracker-transition   Change issue state (open/closed)
+  issue-tracker-comment      Add comment to issue
+  issue-tracker-link-list    List cross-references for an issue
+
+  subagents-check            Probe subagent availability (Convene substrate); always exits 0
+
+  help                 Show this help message
+
+ENVIRONMENT:
+  OJ_HOOK_DEBUG=1                  Enable debug output to stderr (legacy JUNTO_HOOK_DEBUG accepted)
+  OJ_DEVMODE=1                     Enable dev mode feedback collection (legacy JUNTO_DEVMODE accepted)
+  ISSUE_TRACKER_PROJECT=KEY        Default project (owner/repo for GitHub)
+  CODEX_SUBAGENTS_DISABLED=1       Report subagents unavailable
+  CODEX_AGENTS_MAX_THREADS=0       Report subagents unavailable (max_threads=0)
+
+EXAMPLES:
+  oj-helper conductor-inject
+  oj-helper issue-tracker-check
+  oj-helper issue-tracker-list --limit 20
+  oj-helper subagents-check
+  oj-helper feedback-path
+EOF
+    ;;
+  *)
+    die "Unknown subcommand: ${1:-}. Run 'oj-helper help' for usage."
+    ;;
+esac

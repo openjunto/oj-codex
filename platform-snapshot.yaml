@@ -1,0 +1,159 @@
+# platform-snapshot.yaml
+# Mode: defaults
+# Source: juntogen/codex/platform-defaults.yaml (v0.0.1, 2026-06-04)
+# No platform-declaration.yaml found in working directory; no live introspection available.
+# Consumed by: step-01 (model table), step-03 (per-expert model + effort), step-07 (hooks).
+
+_meta:
+  schema_version: "1.0"
+  mode: "defaults"
+  generated_at: "2026-06-05T00:00:00Z"
+  defaults_version: "0.0.1"
+  defaults_version_date: "2026-06-04"
+  # Staleness check: defaults_version_date (2026-06-04) is 1 day before generated_at — delta is trivial; no staleness warning.
+  # introspection_coverage: omitted (mode=defaults; no introspection sub-step ran)
+
+platform:
+  # Identity block (Codex extension — consumed by D64-tooling.md and step prompts
+  # for path/token binding; ignored by platform-agnostic schema consumers).
+  identity:
+    platform_id: "codex"
+    cli_binary: "codex"
+    install_root: "~/.codex"                       # $CODEX_HOME; override via CODEX_HOME env var
+    plugin_root_token: "${PLUGIN_ROOT}"              # resolved by Codex plugin host at hook-invocation time
+    plugin_manifest_dir: ".codex-plugin"           # plugin.json lives here; skills/ hooks/ .mcp.json at plugin root
+    manager_protocol_native_file: "AGENTS.md"      # platform-native instruction file (left to the user)
+
+  tools:
+    # Codex tool surface. The spec corpus uses abstract primitives (Consult/Convene/Inform/Onboard);
+    # their concrete Codex bindings are recorded in the PRIMITIVE BINDINGS comment in platform-defaults.yaml
+    # and D64-tooling.md. These entries document what the Codex session surface exposes.
+
+    # Agent spawning — Consult (single) / Convene (parallel) substrate.
+    # Subagents are defined as TOML files under ~/.codex/agents/ or <repo>/.codex/agents/.
+    # Orchestration is driven by /agent or auto-orchestration; modeled as a capability for derivation parity.
+    - name: "subagents"
+      available: true
+      parameters:
+        - "name"
+        - "description"
+        - "developer_instructions"
+        - "model"
+        - "model_reasoning_effort"
+        - "sandbox_mode"
+        - "mcp_servers"
+
+    # File operations
+    - name: "read_file"
+      available: true
+      parameters:
+        - "path"
+
+    - name: "apply_patch"
+      available: true
+      parameters:
+        - "patch"                    # Codex structured file-edit envelope (create/update/delete)
+
+    # Shell
+    - name: "shell"
+      available: true
+      parameters:
+        - "command"
+        - "workdir"
+        - "timeout"                  # sandbox governed by sandbox_mode + approval_policy
+
+    # Planning
+    - name: "update_plan"
+      available: true
+      parameters:
+        - "plan"
+
+    # Web
+    - name: "web_search"
+      available: true
+      parameters:
+        - "query"
+
+    # Extensibility
+    - name: "mcp"
+      available: true
+      parameters: []                 # MCP servers configured in config.toml / .mcp.json; tools surface dynamically
+
+    - name: "skills"
+      available: true
+      parameters: []                 # Agent Skills (SKILL.md); progressive disclosure
+
+    - name: "custom_prompts"
+      available: true
+      parameters: []                 # Markdown prompts invoked as slash commands (~/.codex/prompts/)
+
+  models:
+    # Exactly 3 tier-mapped models for the gpt-5.5 / gpt-5.3-codex / gpt-5.4-mini generation.
+    # api_id: exact string for config.toml `model = "..."`.
+    # reasoning_effort: Codex-specific default effort per invocation (additive extension over Claude schema).
+    # [VERIFY] markers: context_window, max_output_tokens, cost_ratio — scaffold values pending OpenAI doc confirmation.
+
+    - id: "mini"
+      api_id: "gpt-5.4-mini"
+      tier: "routine"
+      reasoning_effort: "low"
+      context_window: 400000         # [VERIFY]
+      max_output_tokens: 128000      # [VERIFY]
+      cost_ratio: 1.0
+
+    - id: "codex"
+      api_id: "gpt-5.3-codex"
+      tier: "implementation"
+      reasoning_effort: "medium"
+      context_window: 400000         # [VERIFY]
+      max_output_tokens: 128000      # [VERIFY]
+      cost_ratio: 4.0                # [VERIFY] illustrative
+
+    - id: "frontier"
+      api_id: "gpt-5.5"
+      tier: "reasoning"
+      reasoning_effort: "high"
+      context_window: 400000         # [VERIFY]
+      max_output_tokens: 128000      # [VERIFY]
+      cost_ratio: 8.0                # [VERIFY] illustrative
+
+    # Alternates available on the platform (not part of the 3-tier abstraction; for
+    # declaration-mode authors): gpt-5.4 (flagship), gpt-5.2 (prior general), gpt-5.3-codex-spark.
+
+  # Codex extension: reasoning effort is a platform-level capability and a first-class
+  # per-invocation/per-agent knob. Enables per-expert effort binding in step-03 — a
+  # capability the Codex CLI platform exposes natively (not available on competing CLI platforms).
+  reasoning_effort_levels:
+    - "minimal"
+    - "low"
+    - "medium"
+    - "high"
+    - "xhigh"
+
+  hooks:
+    # Codex lifecycle hooks loaded from ~/.codex/hooks.json, <repo>/.codex/hooks.json,
+    # inline [[hooks.*]] in config.toml, or a plugin's hooks/hooks.json (auto-detected).
+    # Hook JSON-on-stdin / JSON-on-stdout contract matches Codex CLI's, including
+    # hookSpecificOutput.additionalContext for context injection.
+
+    - point: "SessionStart"
+      capabilities:
+        - "run_command"
+        - "add_context"              # stdout text OR hookSpecificOutput.additionalContext → developer context
+      matchers:
+        - "startup"
+        - "resume"                   # matcher "" fires for all; OpenJunto uses conductor-inject here
+
+    - point: "SubagentStart"
+      capabilities:
+        - "add_context"              # additionalContext injected as developer context for the subagent (Onboard fallback)
+      matchers: []                   # [VERIFY] matcher semantics for named subagents; "" = all subagents
+
+    # Other available hook points (not consumed by OpenJunto's core binding; listed for completeness):
+    #   SubagentStop, PreToolUse, PostToolUse, PermissionRequest, PreCompact, PostCompact,
+    #   UserPromptSubmit, Stop
+
+  constraints:
+    max_concurrent_agents: 6              # agents.max_threads default (config.toml [agents])
+    max_concurrent_agents_type: "configured"   # tunable, not a hard platform ceiling
+    max_agent_depth: 1                    # agents.max_depth default — nesting/recursion limit
